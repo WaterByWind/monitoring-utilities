@@ -7,7 +7,7 @@ The standard license under which these tools, utilities, and files here are rele
 #### README.md
 This file (the one being read).
 
-## <u>Contents</u>
+### <u>Contents</u>
 A list of tools and utilities provided here.
 
 #### stats-er.py
@@ -36,3 +36,8 @@ The current EdgeOS distribution is based upon Debian Wheezy, which does not itse
     2.  `cd /config/scripts/stats-er`
     3.  `tar xpf /tmp/pdepend.tgz`
 3.  Copy the `stats-er.py` into `/config/scripts/stats-er` and edit appropriately.  The script will find the dependent libraries from within the directory where it is located.
+
+#### ubnt-edgerouter-extend-dashboard.json
+Sample [Grafana](https://grafana.com) dashboard for use with the above `stats-er.py` publishing to InfluxDB.
+
+To use, configure the database used by `stats-er.py` as a new datasource in your local Grafana instance, then import the .json into that same instance.
