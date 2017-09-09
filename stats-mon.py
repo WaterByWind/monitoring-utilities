@@ -1,6 +1,29 @@
 #!/usr/bin/python
 #
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# The MIT License (MIT)
+#
+# Copyright (c) 2017 Waterside Consulting, inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 """
 stats-mon.py:  Collect metrics and log to time-series database
 
@@ -47,9 +70,10 @@ from logging.handlers import SysLogHandler
 from socket import gethostname
 
 # For EdgeOS without standard modules which all get listed below
+# This specific method is needed for now but may change back to from . import. . .
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# python-influxdb seems to be "broken" now and needs the extra imports
+# python-influxdb seems to be "broken" now and needs the extra explicit imports
 import requests
 import requests.exceptions
 from influxdb import InfluxDBClient
@@ -57,6 +81,16 @@ from influxdb.exceptions import InfluxDBClientError
 from influxdb.exceptions import InfluxDBServerError
 
 # TODOs
+# - cmd line options
+# - possible as snmpd subagent (AgentX?)
+# - additional metrics
+#   - firewall/nat hit counts
+#   - conntrack?  Prob need conntrackd which doesn't exist here
+#   - services?
+# - Additional publish services?
+# - Drop privileges? (not run as root)
+#   - Risk and value here?
+# - Internal metrics (cpu, etc) for tracking monitoring impact
 #
 # Modules for AgentX:
 # -- netsnmpagent:  https://pypi.python.org/pypi/netsnmpagent
@@ -579,17 +613,15 @@ class PidFileLock(object):
             # PID exists
             raise ProcessRunningError('Existing instance pid={}'.format(_pid))
 
-        attempts = MAX_LOCK_ATTEMPT
-        while attempts > 0:
+        for attempts in xrange(MAX_LOCK_ATTEMPT):
             logging.debug(
-                'Lock attempt {}'.format(MAX_LOCK_ATTEMPT + 1 - attempts))
+                'Lock attempt {}'.format(attempts + 1))
             if _tryLock():
                 os.write(self.fd, str(self.pid))
                 return(True)
             if not _staleLock():
                 raise AcquireLockError(
                     'Unexpected state while checking existing pid')
-            attempts -= 1
         raise AcquireLockError(
             'Too mamy attempts: {}'.format(MAX_LOCK_ATTEMPT))
 
