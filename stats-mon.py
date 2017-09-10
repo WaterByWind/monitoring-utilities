@@ -194,7 +194,7 @@ class MissingOSExecutable(RuntimeError):
 
     def __init__(self, msg='(unknown)'):
         self.msg = 'Missing OS executable: {}'.format(msg)
-        super(RuntimeError, self).__init__(self.msg)
+        super(MissingOSExecutable, self).__init__(self.msg)
 
 
 class NothingToDo(RuntimeError):
@@ -202,7 +202,7 @@ class NothingToDo(RuntimeError):
 
     def __init__(self, msg='(unknown)'):
         self.msg = 'Nothing to do: {}'.format(msg)
-        super(RuntimeError, self).__init__(self.msg)
+        super(NothingToDo, self).__init__(self.msg)
 
 
 class InternalError(RuntimeError):
@@ -210,7 +210,7 @@ class InternalError(RuntimeError):
 
     def __init__(self, msg='(unknown)'):
         self.msg = 'Internal error: {}'.format(msg)
-        super(RuntimeError, self).__init__(self.msg)
+        super(InternalError, self).__init__(self.msg)
 
 
 class UnexpectUseError(InternalError):
