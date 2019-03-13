@@ -3,7 +3,7 @@
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 # The MIT License (MIT)
 #
-# Copyright (c) 2017 Waterside Consulting, inc.
+# Copyright (c) 2016-2019 Waterside Consulting, inc.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -29,7 +29,8 @@ stats-mon.py:  Collect metrics and log to time-series database
 
 Used to supplement standard SNMP monitoring for metrics not otherwise reported.
 Initial support for Fan speeds, Temperatures, and Power consumption of
-Ubiquiti EdgeOS-based EdgeMAX platforms.
+Ubiquiti EdgeOS-based EdgeMAX platforms.  Additional support now includes
+netfilter (iptables) rule counters.
 
 Metrics are collected and consolidated as relevant time-series measurements.
 Each poll cycle is further consolidated as a single measurement set for
@@ -46,9 +47,9 @@ syslog handler explicitly configured.
 """
 
 __author__     = "WaterByWind"
-__copyright__  = "Copyright 2017, Waterside Consulting, inc."
+__copyright__  = "Copyright 2019, Waterside Consulting, inc."
 __license__    = "MIT"
-__version__    = "1.0"
+__version__    = "1.2"
 __maintainer__ = "WaterByWind"
 __email__      = "WaterByWind@WatersideConsulting.com"
 __status__     = "Development"
@@ -57,21 +58,32 @@ __status__     = "Development"
 ##
 # Dependencies
 ##
+#
+# Python Modules
+# - subprocess32:     https://pypi.org/project/subprocess32/
+# - python-iptables:  https://pypi.org/project/python-iptables/
+# - influxdb:         https://pypi.org/project/influxdb/
+# - requests:         https://pypi.org/project/requests/
+# - urllib3:          https://pypi.org/project/urllib3/
+#
 import sys
 import os
 import time
 import re
 import errno
-import subprocess
 import logging
 import resource
 from datetime import datetime
 from logging.handlers import SysLogHandler
 from socket import gethostname
 
-# For EdgeOS without standard modules which all get listed below
-# This specific method is needed for now but may change back to from . import. . .
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# For modules not bundled with EdgeOS, which are in turn listed below
+# This specific method is needed for now but may change back to relative imports
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),'lib'))
+
+# Sanitize executable search path.  'python-iptables' depends upon '/sbin'
+# being in the PATH, so let's just get this out of the way now.
+os.environ['PATH'] = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 # python-influxdb seems to be "broken" now and needs the extra explicit imports
 import requests
@@ -80,11 +92,34 @@ from influxdb import InfluxDBClient
 from influxdb.exceptions import InfluxDBClientError
 from influxdb.exceptions import InfluxDBServerError
 
+# Try to use improved subprocess32 from Python 3
+# If not available fall back to bundled module
+if os.name == 'posix' and sys.version_info[0] < 3:
+    try:
+        import subprocess32 as subprocess
+    except ImportError:
+        import subprocess
+else:
+    import subprocess
+
+# Try to use python-iptables.  This is optional, so don't fail if missing
+try:
+    import iptc
+except ImportError:
+    iptc = None
+
+#
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+##
 # TODOs
+##
+## Need check for running as root
+#
 # - cmd line options
 # - possible as snmpd subagent (AgentX?)
 # - additional metrics
-#   - firewall/nat hit counts
 #   - conntrack?  Prob need conntrackd which doesn't exist here
 #   - services?
 # - Additional publish services?
@@ -96,7 +131,7 @@ from influxdb.exceptions import InfluxDBServerError
 # -- netsnmpagent:  https://pypi.python.org/pypi/netsnmpagent
 # -- pyagentx:      https://pypi.python.org/pypi/pyagentx
 #
-
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 ##
@@ -109,17 +144,17 @@ TIME_POLL_INTERVAL = 60.0
 # Maximum number of queued measurement sets
 MAX_SETS_QUEUED = 1024
 
-# Detach and become daemon
+# Detach and become daemon?
 DEF_DAEMON = True
 
 # Logging
-LOGLEVEL = logging.DEBUG                # Python logging level
+LOGLEVEL = logging.INFO                 # Python logging level
 LOGFACILITY = SysLogHandler.LOG_LOCAL5  # syslog facility
 LOGSOCK = '/dev/log'                    # syslog socket
 
 # Defaults for becoming daemon
 DEF_DIR_WORK = '/'                      # Default working dir
-DEF_UMASK = 0o0000                      # Default UMASK in octal
+DEF_UMASK = 0o0000                      # Default UMASK
 DEF_MAX_FD = 4096                       # Default max FD to close()
 
 # Defaults for PID lockfile
@@ -146,22 +181,30 @@ INFLUXDB = {
 # "Constant" definitions
 ##
 # Capabilities known
-CAP_FAN = 'fan'
+CAP_FANTACH = 'fan'
+CAP_FANCTRL = 'fanctrl'
 CAP_POWER = 'power'
 CAP_TEMP = 'temp'
-LIST_CAP = [CAP_FAN, CAP_POWER, CAP_TEMP]
+CAP_IPTABLES = 'iptables'
+LIST_CAP = [CAP_FANTACH, CAP_FANCTRL, CAP_POWER, CAP_TEMP, CAP_IPTABLES]
 
 # External paths and arguments
 BIN_UBNTHAL = '/usr/sbin/ubnt-hal'
 
 CMD_HAL = {
-    CAP_FAN: 'getFanTach',
+    CAP_FANTACH: 'getFanTach',
+    CAP_FANCTRL: 'getFanCtrl',
     CAP_POWER: 'getPowerStatus',
     CAP_TEMP: 'getTemp'
 }
 
 # Device types known
 DEV_EDGEROUTER = 'edgerouter'
+
+# Protocols
+PROTO_IPv4 = 4
+PROTO_IPv6 = 6
+LIST_PROTO_IP = [PROTO_IPv4, PROTO_IPv6]
 
 #
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
@@ -213,13 +256,28 @@ class InternalError(RuntimeError):
         super(InternalError, self).__init__(self.msg)
 
 
-class UnexpectUseError(InternalError):
+class NotImplementedError(InternalError):
+    """ Attempt to use method/function that has been defined but not implemented """
+    pass
+
+
+class UnexpectedUseError(InternalError):
     """ Unexpected attempt to use/monitor non-existing entity """
+    pass
+
+
+class UnexpectedTableError(InternalError):
+    """ Unexpected iptables table name passed """
     pass
 
 
 class MeasureMismatchError(InternalError):
     """ Attempt to add mismatched measurement to series """
+    pass
+
+
+class MissingDataSourceError(InternalError):
+    """ Asserted capability has no data source """
     pass
 
 
@@ -258,6 +316,8 @@ class DaemonOpenError(DaemonError):
         self.msg = 'Failed {}: [errno={}] {}'.format(_msg, e.errno, e.strerror)
         super(DaemonOpenError, self).__init__(self.msg)
 
+#
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 ##
@@ -266,6 +326,8 @@ class DaemonOpenError(DaemonError):
 # -- perhaps create base class TimeSeriesPublisher with more dbs supported?
 
 class InfluxDBPublisher(object):
+    """ Class for publishing to InfluxDB time-series database """
+
     def __init__(self,
                  host='localhost',
                  port=8086,
@@ -328,9 +390,8 @@ class InfluxDBPublisher(object):
             # If reached/exceeded maximum number of queueed measurement
             # sets discard oldest entries to accomodate new entries
             while len(self.dataList) >= MAX_SETS_QUEUED:
-                logging.warning(
-                    'Max queued measurement set count of {} exceeded'.format(MAX_SETS_QUEUED))
                 discard = self.dataList.pop(0)
+                logging.warning('Max count ({}) of queued measurement sets exceeded'.format(MAX_SETS_QUEUED))
                 logging.warning('Discarding oldest set: {}'.format(discard))
             self.dataList.append(self._pointSet)
             self._pointSet = []
@@ -348,6 +409,8 @@ class InfluxDBPublisher(object):
                     'Deferring publish of {} sets to next poll interval'.format(len(self.dataList)))
                 break
 
+#
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 ##
@@ -355,31 +418,58 @@ class InfluxDBPublisher(object):
 ##
 
 class BaseDevice(object):
+    """ Base class for all monitored devices """
+
     def __init__(self):
         self._method = {}.fromkeys(LIST_CAP, None)
+        self._dsClass = {}.fromkeys(LIST_CAP, None)
+        self._mpClass = {}.fromkeys(LIST_CAP, None)
+        self._dataSource = {}.fromkeys(LIST_CAP, None)
         self._measurements = []
 
     def _regMethod(self, cap, method):
         self._method[cap] = method
 
-    def _fetchExt(self, mp, cap, cmd):
+    def _regDSClass(self, cap, classobj):
+        self._dsClass[cap] = classobj
+
+    def _regMPClass(self, cap, classobj):
+        self._mpClass[cap] = classobj
+
+    def getDSClass(self, cap):
+        return(self._dsClass.get(cap, None))
+
+    def getMPClass(self, cap):
+        return(self._mpClass.get(cap, None))
+
+    def _newDSinst(self, cap):
+        DS = self.getDSClass(cap)
+        if not DS:
+            cls = type(self).__name__
+            func = sys._getframe(1).f_code.co_name
+            msg = '{}.{}: Unexpected attempt to use undefined data source: \'{}\''.format(
+                cls, func, cap)
+            raise UnexpectedUseError(msg)
+        self._dataSource[cap] = DS(cap)
+
+    def _fetchData(self, cap):
         if not self.hasCap(cap):
             cls = type(self).__name__
             func = sys._getframe(1).f_code.co_name
-            cstr = ' '.join(map(str, cmd))
             msg = '{}.{}: Unexpected attempt to use non-asserted capability: \'{}\''.format(
-                cls, func, cstr)
-            raise UnexpectUseError(msg)
-        elif mp.measurement != cap:
+                cls, func, cap)
+            raise UnexpectedUseError(msg)
+        elif not self.hasDataSource(cap):
             cls = type(self).__name__
             func = sys._getframe(1).f_code.co_name
-            msg = '{}.{}: Incorrect measurement type \'{}\' passed'.format(
-                cls, func, mp.measurement)
-            raise MeasureMismatchError(msg)
+            msg = '{}.{}: Asserted capability has no data source: \'{}\''.format(
+                cls, func, cap)
+            raise MissingDataSourceError(msg)
         else:
-            # Should probably catch subprocess.CalledProcessError and OSError
-            cmdOut = subprocess.check_output(cmd)
-        return(cmdOut)
+            if not self.hasDSinst(cap):
+                self._newDSinst(cap)
+            fetchOut = self._dataSource[cap].getstats()
+        return(fetchOut)
 
     def listCap(self):
         return ([k for k, v in self._method.items() if v is not None])
@@ -387,54 +477,79 @@ class BaseDevice(object):
     def hasCap(self, key):
         return (self._method.get(key, None) is not None)
 
-    def read(self, cap, mp):
-        success = False
-        mp.resetpoint()
+    def hasDataSource(self, key):
+        return (self._dsClass.get(key, None) is not None)
+
+    def hasDSinst(self, key):
+        return (self._dataSource.get(key, None) is not None)
+
+    def read(self, cap):
         f = self._method.get(cap, None)
-        if f is not None:
-            success = f(mp)
-        return(success)
+        if f is None:
+            cls = type(self).__name__
+            func = sys._getframe(1).f_code.co_name
+            msg = '{}.{}: Unexpected attempt to use undefined read method: \'{}\''.format(
+                cls, func, cap)
+            raise UnexpectedUseError(msg)
+        return(f(cap))
 
 
 class EdgeRouter(BaseDevice):
+    """ Class for Ubiquiti EdgeMAX EdgeRouter devices """
+
     def __init__(self):
         super(EdgeRouter, self).__init__()
         self.devtype = DEV_EDGEROUTER
         if not os.path.isfile(BIN_UBNTHAL):
             raise MissingOSExecutable(BIN_UBNTHAL)
-
-        # If capability is supported, assert availability
-        if self._checkCap(CAP_FAN):
-            self._regMethod(CAP_FAN, self._readFan)
+        # If capability is supported, assert availability, define data source and measurement
+        if self._checkCap(CAP_FANTACH):
+            self._regMethod(CAP_FANTACH, self._readFanTach)
+            self._regDSClass(CAP_FANTACH, UBNTHALSource)
+            self._regMPClass(CAP_FANTACH, FanSpeeds)
+        if self._checkCap(CAP_FANCTRL):
+            self._regMethod(CAP_FANCTRL, self._readFanCtrl)
+            self._regDSClass(CAP_FANCTRL, UBNTHALSource)
+            self._regMPClass(CAP_FANCTRL, FanControl)
         if self._checkCap(CAP_POWER):
             self._regMethod(CAP_POWER, self._readPower)
+            self._regDSClass(CAP_POWER, UBNTHALSource)
+            self._regMPClass(CAP_POWER, PowerUse)
         if self._checkCap(CAP_TEMP):
             self._regMethod(CAP_TEMP, self._readTemp)
-        return
+            self._regDSClass(CAP_TEMP, UBNTHALSource)
+            self._regMPClass(CAP_TEMP, Temperatures)
+        if self._checkCap(CAP_IPTABLES):
+            self._regMethod(CAP_IPTABLES, self._readIPtables)
+            self._regDSClass(CAP_IPTABLES, IPtableSource)
+            self._regMPClass(CAP_IPTABLES, IPtables)
 
     def _checkCap(self, cap):
-        cmd = [BIN_UBNTHAL, CMD_HAL[cap]]
         supported = False
-        try:
-            out = subprocess.check_output(
-                cmd, stderr=subprocess.STDOUT).splitlines()[-1]
-        except subprocess.CalledProcessError:
-            pass
+        if cap == CAP_IPTABLES:
+            supported = (iptc is not None)
         else:
-            if not out.endswith('not supported on this platform'):
-                supported = True
+            try:
+                out = subprocess.check_output([BIN_UBNTHAL, CMD_HAL[cap]],
+                    stderr=subprocess.STDOUT).splitlines()[-1]
+            except subprocess.CalledProcessError:
+                pass
+            else:
+                if not out.endswith('not supported on this platform'):
+                    supported = True
+        if supported:
+            logging.debug("Has capability '{}'".format(cap))
         return(supported)
 
-    def _readFan(self, mp):
-        cmd = [BIN_UBNTHAL, CMD_HAL[CAP_FAN]]
-        success = False
-
+    def _readFanTach(self, cap):
         try:
-            cmdOut = self._fetchExt(mp, CAP_FAN, cmd)
-        except (UnexpectUseError, MeasureMismatchError) as e:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
             logging.warning(e.msg)
         else:
-            for line in cmdOut.splitlines():
+            mp = self.getMPClass(cap)()
+            mp.resetpoint()
+            for line in fetchOut.splitlines():
                 items = line.split(':')
                 if len(items) < 2:
                     continue
@@ -442,19 +557,30 @@ class EdgeRouter(BaseDevice):
                 val = re.sub(r'\s*([0-9]*)\s*RPM\s*', r'\1', items[1])
                 if val != '':
                     mp.addfield(key, int(val))
-            success = True
-        return(success)
+        return([mp])
 
-    def _readPower(self, mp):
-        cmd = [BIN_UBNTHAL, CMD_HAL[CAP_POWER]]
-        success = False
-
+    def _readFanCtrl(self, cap):
         try:
-            cmdOut = self._fetchExt(mp, CAP_POWER, cmd)
-        except (UnexpectUseError, MeasureMismatchError) as e:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
             logging.warning(e.msg)
         else:
-            for line in cmdOut.splitlines():
+            mp = self.getMPClass(cap)()
+            mp.resetpoint()
+            key = 'fanctrl'
+            if fetchOut != '':
+                mp.addfield(key, int(fetchOut))
+        return([mp])
+
+    def _readPower(self, cap):
+        try:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
+            logging.warning(e.msg)
+        else:
+            mp = self.getMPClass(cap)()
+            mp.resetpoint()
+            for line in fetchOut.splitlines():
                 items = line.split(':')
                 if len(items) < 2:
                     continue
@@ -462,19 +588,17 @@ class EdgeRouter(BaseDevice):
                 val = re.sub(r'\s*([0-9.]*)\s*[VAW]\s*', r'\1', items[1])
                 if val != '':
                     mp.addfield(key, float(val))
-            success = True
-        return(success)
+        return([mp])
 
-    def _readTemp(self, mp):
-        cmd = [BIN_UBNTHAL, CMD_HAL[CAP_TEMP]]
-        success = False
-
+    def _readTemp(self, cap):
         try:
-            cmdOut = self._fetchExt(mp, CAP_TEMP, cmd)
-        except (UnexpectUseError, MeasureMismatchError) as e:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
             logging.warning(e.msg)
         else:
-            for line in cmdOut.splitlines():
+            mp = self.getMPClass(cap)()
+            mp.resetpoint()
+            for line in fetchOut.splitlines():
                 items = line.split(':')
                 if len(items) < 2:
                     continue
@@ -482,9 +606,148 @@ class EdgeRouter(BaseDevice):
                 val = re.sub(r'\s*([0-9.]*)\s*C\s*', r'\1', items[1])
                 if val != '':
                     mp.addfield(key, float(val))
-            success = True
-        return(success)
+        return([mp])
 
+    def _readIPtables(self, cap):
+        mpList = []
+        MPClass = self.getMPClass(cap)
+        try:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, UnexpectedTableError,
+            MissingDataSourceError, MeasureMismatchError) as e:
+            logging.warning(e.msg)
+        else:
+            for p in fetchOut.keys():
+                for t in fetchOut[p].keys():
+                    tStamp = fetchOut[p][t]['tStamp']
+                    for c in fetchOut[p][t]['chains'].keys():
+                        rList = fetchOut[p][t]['chains'][c]
+                        for rule in rList.keys():
+                            mp = MPClass()
+                            mp.setpoint(tStamp)
+                            mp.addtag('proto', 'IPv{}'.format(p))
+                            mp.addtag('table', t)
+                            mp.addtag('chain', c)
+                            # EdgeOS rule comments, trimmed, as rule name
+                            mp.addtag('ruleid', re.sub(r'([0-9]*)\s.*', r'\1', rule))
+                            mp.addfield('pkts', rList[rule]['pkts'])
+                            mp.addfield('bytes', rList[rule]['bytes'])
+                            mpList.append(mp)
+        return(mpList)
+
+#
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+##
+# Data source classes
+##
+
+class DataSource(object):
+    """ Base class for all data sources """
+
+    def __init__(self, cap):
+        return
+
+    def getstats(self):
+        raise NotImplementedError()
+
+
+class UBNTHALSource(DataSource):
+    """ Class for data obtained via external executable 'ubnt-hal' """
+
+    def __init__(self, cap):
+        super(UBNTHALSource, self).__init__(cap)
+        try:
+            self.cmd = [BIN_UBNTHAL, CMD_HAL[cap]]
+        except KeyError:
+            cls = type(self).__name__
+            func = sys._getframe(1).f_code.co_name
+            msg = '{}.{}: Unexpected attempt to use improperly-defined capability: \'{}\''.format(
+                cls, func, cap)
+            raise UnexpectedUseError(msg)
+
+    def getstats(self):
+        logging.debug("About to exec '{}'".format(' '.join(self.cmd)))
+        try:
+            cmdOut = subprocess.check_output(self.cmd, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            logging.warning("Failed '{}' with return code {}: {}".format(
+                ' '.join(e.cmd), e.returncode, e.output))
+        # Should probably catch more exceptions, particularly OSError
+        return(cmdOut)
+
+
+class IPtableSource(DataSource):
+    """ Class for data obtained via 'python-iptables' module """
+
+    def __init__(self, cap):
+        super(IPtableSource, self).__init__(cap)
+        self.tableList = {
+            PROTO_IPv4: [iptc.Table.FILTER, iptc.Table.MANGLE, iptc.Table.NAT],
+            PROTO_IPv6: [iptc.Table6.FILTER, iptc.Table6.MANGLE]
+        }
+        self.iptable = {
+            PROTO_IPv4: {k: None for k in self.tableList[PROTO_IPv4]},
+            PROTO_IPv6: {k: None for k in self.tableList[PROTO_IPv6]}
+        }
+        self.stats = {}
+
+    def _resetstats(self, proto, table):
+        if proto not in self.stats:
+            self.stats[proto] = {}
+        self.stats[proto][table] = {}
+
+    def _addStats(self, proto, table, chains, tstamp):
+        self.stats[proto][table]['tStamp'] = tstamp
+        self.stats[proto][table]['chains'] = chains
+
+    def _extractStats(self, proto, table):
+        """ Extract raw stats from iptables internal metrics """
+        try:
+            if self.iptable[proto][table]:
+                logging.debug('Refreshing iptables v{} table \'{}\''.format(proto, table))
+                self.iptable[proto][table].refresh()
+            else:
+                logging.debug('Fetching iptables v{} table \'{}\''.format(proto, table))
+                if proto == PROTO_IPv4:
+                    self.iptable[proto][table] = iptc.Table(table)
+                else:
+                    self.iptable[proto][table] = iptc.Table6(table)
+        except KeyError:
+            cls = type(self).__name__
+            func = sys._getframe(1).f_code.co_name
+            msg = '{}.{}: Unknown iptables v{} table name passed: \'{}\''.format(
+                cls, func, proto, table)
+            raise UnexpectedTableError(msg)
+        _tstmp = datetime.utcnow()
+        self._resetstats(proto, table)
+        chainList = {}
+        for c in self.iptable[proto][table].chains:
+            rstats = {}
+            for r in c.rules:
+                if r.target.name == 'LOG':
+                    continue
+                (_p, _b) = r.get_counters()
+                for m in r.matches:
+                    if m.name == 'comment':
+                        if m.comment not in rstats:
+                            rstats[m.comment] = {'pkts': _p, 'bytes': _b}
+                        else:
+                            rstats[m.comment]['pkts'] += _p
+                            rstats[m.comment]['bytes'] += _b
+            if rstats:
+                chainList[c.name] = rstats
+        self._addStats(proto, table, chainList, _tstmp)
+
+    def getstats(self):
+        for p in LIST_PROTO_IP:
+            for t in self.tableList[p]:
+                self._extractStats(p, t)
+        return(self.stats)
+
+#
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 ##
@@ -492,7 +755,7 @@ class EdgeRouter(BaseDevice):
 ##
 
 class MeasurePoint(object):
-    """ Base class for all measurements """
+    """ Base class for all measurements, ready for publication to time-series database """
 
     def __init__(self):
         self._resettags()
@@ -506,6 +769,13 @@ class MeasurePoint(object):
 
     def _stamptime(self):
         self.tstamp = datetime.utcnow()
+
+    def settimestamp(self, t):
+        self.tstamp = t
+
+    def setpoint(self, t):
+        self.addtag('host', gethostname())
+        self.settimestamp(t)
 
     def resetpoint(self):
         self._resettags()
@@ -543,7 +813,15 @@ class FanSpeeds(MeasurePoint):
 
     def __init__(self):
         super(FanSpeeds, self).__init__()
-        self.measurement = CAP_FAN
+        self.measurement = CAP_FANTACH
+
+
+class FanControl(MeasurePoint):
+    """ Fan control time series measurement """
+
+    def __init__(self):
+        super(FanControl, self).__init__()
+        self.measurement = CAP_FANCTRL
 
 
 class PowerUse(MeasurePoint):
@@ -561,6 +839,16 @@ class Temperatures(MeasurePoint):
         super(Temperatures, self).__init__()
         self.measurement = CAP_TEMP
 
+
+class IPtables(MeasurePoint):
+    """ IPtables time series measurement """
+
+    def __init__(self):
+        super(IPtables, self).__init__()
+        self.measurement = CAP_IPTABLES
+
+#
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 ##
@@ -634,6 +922,8 @@ class PidFileLock(object):
             pass
         return(False)
 
+#
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 ##
@@ -704,19 +994,12 @@ def daemonize(workdir='/', umask=0o0000):
     logging.debug('Now running as a daemon')
 
 
-# Process one full monitor cycle
-# TODO:  This needs work!
 def doCycle(monDev, dbC):
+    """ Process one full monitor cycle """
     for c in monDev.listCap():
-        if c == CAP_FAN:
-            p = FanSpeeds()
-        elif c == CAP_POWER:
-            p = PowerUse()
-        elif c == CAP_TEMP:
-            p = Temperatures()
-        monDev.read(c, p)
-        logging.debug('Measurement: {}'.format(p.getRecInflux()))
-        dbC.queuePoint(p.getRecJSON())
+        for p in monDev.read(c):
+            logging.debug('Measurement: {}'.format(p.getRecInflux()))
+            dbC.queuePoint(p.getRecJSON())
     dbC.publish()
 
 
@@ -750,11 +1033,13 @@ def main():
             else:
                 logging.warning(
                     'Cycle exceeded polling interval by {} seconds'.format(abs(dSec)))
-            logging.debug('End cycle')
+            logging.debug('End cycle [duration {}]'.format(tDiff))
 
     # Should never reach here
     logging.info('Ending (unexpected)')
 
+#
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 ##
