@@ -49,7 +49,7 @@ syslog handler explicitly configured.
 __author__     = "WaterByWind"
 __copyright__  = "Copyright 2019, Waterside Consulting, inc."
 __license__    = "MIT"
-__version__    = "1.2"
+__version__    = "1.2.1"
 __maintainer__ = "WaterByWind"
 __email__      = "WaterByWind@WatersideConsulting.com"
 __status__     = "Development"
