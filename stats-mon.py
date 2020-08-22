@@ -3,7 +3,7 @@
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 # The MIT License (MIT)
 #
-# Copyright (c) 2016-2019 Waterside Consulting, inc.
+# Copyright (c) 2016-2020 Waterside Consulting, inc.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -30,7 +30,8 @@ stats-mon.py:  Collect metrics and log to time-series database
 Used to supplement standard SNMP monitoring for metrics not otherwise reported.
 Initial support for Fan speeds, Temperatures, and Power consumption of
 Ubiquiti EdgeOS-based EdgeMAX platforms.  Additional support now includes
-netfilter (iptables) rule counters.
+netfilter (iptables) rule counters, detailed memory stats, conntrack,
+kernel "random" entropy, vmstat, and offload stats.
 
 Metrics are collected and consolidated as relevant time-series measurements.
 Each poll cycle is further consolidated as a single measurement set for
@@ -47,9 +48,9 @@ syslog handler explicitly configured.
 """
 
 __author__     = "WaterByWind"
-__copyright__  = "Copyright 2019, Waterside Consulting, inc."
+__copyright__  = "Copyright 2020, Waterside Consulting, inc."
 __license__    = "MIT"
-__version__    = "1.2.1"
+__version__    = "1.2.4"
 __maintainer__ = "WaterByWind"
 __email__      = "WaterByWind@WatersideConsulting.com"
 __status__     = "Development"
@@ -72,6 +73,7 @@ import time
 import re
 import errno
 import logging
+import signal
 import resource
 from datetime import datetime
 from logging.handlers import SysLogHandler
@@ -93,7 +95,7 @@ from influxdb.exceptions import InfluxDBClientError
 from influxdb.exceptions import InfluxDBServerError
 
 # Try to use improved subprocess32 from Python 3
-# If not available fall back to bundled module
+# If not available fall back to original module
 if os.name == 'posix' and sys.version_info[0] < 3:
     try:
         import subprocess32 as subprocess
@@ -142,7 +144,7 @@ except ImportError:
 TIME_POLL_INTERVAL = 60.0
 
 # Maximum number of queued measurement sets
-MAX_SETS_QUEUED = 1024
+MAX_SETS_QUEUED = 1440
 
 # Detach and become daemon?
 DEF_DAEMON = True
@@ -181,22 +183,45 @@ INFLUXDB = {
 # "Constant" definitions
 ##
 # Capabilities known
-CAP_FANTACH = 'fan'
-CAP_FANCTRL = 'fanctrl'
-CAP_POWER = 'power'
-CAP_TEMP = 'temp'
-CAP_IPTABLES = 'iptables'
-LIST_CAP = [CAP_FANTACH, CAP_FANCTRL, CAP_POWER, CAP_TEMP, CAP_IPTABLES]
+CAP_FANTACH    = 'fan'
+CAP_FANCTRL    = 'fanctrl'
+CAP_POWER      = 'power'
+CAP_TEMP       = 'temp'
+CAP_IPTABLES   = 'iptables'
+CAP_MEMINFO    = 'meminfo'
+CAP_VMSTAT     = 'vmstat'
+CAP_CAVSTAT    = 'caviumstat'
+CAP_CONNTRACK  = 'conntrack'
+CAP_ENTROPY    = 'randentropy'
+CAP_INTERRUPTS = 'interrupts'
+CAP_SOFTIRQS   = 'softirqs'
+
+# Default capabilities to attempt to use
+LIST_CAP = [CAP_FANTACH, CAP_FANCTRL, CAP_POWER, CAP_TEMP, CAP_IPTABLES,
+    CAP_MEMINFO, CAP_VMSTAT, CAP_CAVSTAT, CAP_CONNTRACK, CAP_ENTROPY,
+    CAP_INTERRUPTS, CAP_SOFTIRQS]
 
 # External paths and arguments
 BIN_UBNTHAL = '/usr/sbin/ubnt-hal'
 
 CMD_HAL = {
-    CAP_FANTACH: 'getFanTach',
-    CAP_FANCTRL: 'getFanCtrl',
-    CAP_POWER: 'getPowerStatus',
-    CAP_TEMP: 'getTemp'
+    CAP_FANTACH : 'getFanTach',
+    CAP_FANCTRL : 'getFanCtrl',
+    CAP_POWER   : 'getPowerStatus',
+    CAP_TEMP    : 'getTemp'
 }
+
+PROC_PATH = {
+    CAP_MEMINFO    : '/proc/meminfo',
+    CAP_VMSTAT     : '/proc/vmstat',
+    CAP_CAVSTAT    : '/proc/cavium/stats',
+    CAP_CONNTRACK  : '/proc/sys/net/netfilter',
+    CAP_ENTROPY    : '/proc/sys/kernel/random/entropy_avail',
+    CAP_INTERRUPTS : '/proc/interrupts',
+    CAP_SOFTIRQS   : '/proc/softirqs'
+}
+
+LIST_FN_CONNTRACK = ['nf_conntrack_max', 'nf_conntrack_count']
 
 # Device types known
 DEV_EDGEROUTER = 'edgerouter'
@@ -523,12 +548,43 @@ class EdgeRouter(BaseDevice):
             self._regMethod(CAP_IPTABLES, self._readIPtables)
             self._regDSClass(CAP_IPTABLES, IPtableSource)
             self._regMPClass(CAP_IPTABLES, IPtables)
+        if self._checkCap(CAP_MEMINFO):
+            self._regMethod(CAP_MEMINFO, self._readMemInfo)
+            self._regDSClass(CAP_MEMINFO, ProcFSSource)
+            self._regMPClass(CAP_MEMINFO, ProcMemInfo)
+        if self._checkCap(CAP_VMSTAT):
+            self._regMethod(CAP_VMSTAT, self._readVMStat)
+            self._regDSClass(CAP_VMSTAT, ProcFSSource)
+            self._regMPClass(CAP_VMSTAT, ProcVMStat)
+        if self._checkCap(CAP_CAVSTAT):
+            self._regMethod(CAP_CAVSTAT, self._readCavStats)
+            self._regDSClass(CAP_CAVSTAT, ProcFSSource)
+            self._regMPClass(CAP_CAVSTAT, ProcCavStat)
+        if self._checkCap(CAP_ENTROPY):
+            self._regMethod(CAP_ENTROPY, self._readEntropyAvail)
+            self._regDSClass(CAP_ENTROPY, ProcFSSource)
+            self._regMPClass(CAP_ENTROPY, ProcEntropyAvail)
+        if self._checkCap(CAP_CONNTRACK):
+            self._regMethod(CAP_CONNTRACK, self._readConntrack)
+            self._regDSClass(CAP_CONNTRACK, ProcFSSource)
+            self._regMPClass(CAP_CONNTRACK, ProcConntrack)
+        if self._checkCap(CAP_INTERRUPTS):
+            self._regMethod(CAP_INTERRUPTS, self._readInterrupts)
+            self._regDSClass(CAP_INTERRUPTS, ProcFSSource)
+            self._regMPClass(CAP_INTERRUPTS, ProcInterrupts)
+        if self._checkCap(CAP_SOFTIRQS):
+            self._regMethod(CAP_SOFTIRQS, self._readSoftIRQs)
+            self._regDSClass(CAP_SOFTIRQS, ProcFSSource)
+            self._regMPClass(CAP_SOFTIRQS, ProcSoftIRQs)
+
 
     def _checkCap(self, cap):
         supported = False
         if cap == CAP_IPTABLES:
             supported = (iptc is not None)
-        else:
+        elif cap in PROC_PATH:
+            supported = os.path.isfile(PROC_PATH[cap])
+        elif cap in CMD_HAL:
             try:
                 out = subprocess.check_output([BIN_UBNTHAL, CMD_HAL[cap]],
                     stderr=subprocess.STDOUT).splitlines()[-1]
@@ -537,6 +593,12 @@ class EdgeRouter(BaseDevice):
             else:
                 if not out.endswith('not supported on this platform'):
                     supported = True
+        else:
+            cls = type(self).__name__
+            func = sys._getframe(1).f_code.co_name
+            msg = '{}.{}: Unexpected attempt to use non-implemented capability: \'{}\''.format(
+                cls, func, cap)
+            raise UnexpectedUseError(msg)
         if supported:
             logging.debug("Has capability '{}'".format(cap))
         return(supported)
@@ -635,6 +697,169 @@ class EdgeRouter(BaseDevice):
                             mpList.append(mp)
         return(mpList)
 
+    def _readMemInfo(self, cap):
+        try:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
+            logging.warning(e.msg)
+        else:
+            mp = self.getMPClass(cap)()
+            mp.resetpoint()
+            for line in fetchOut.splitlines():
+                items = line.split(':', 1)
+                if len(items) < 2:
+                    continue
+                key = items[0].strip()
+                dat = items[1].strip()
+                val = int(re.sub(r'\s*([0-9]*)\s*.*', r'\1', dat))
+                scale = re.sub(r'\s*[0-9]*\s*([kKmMgG])[bB].*', r'\1', dat)
+                # At least as of kernel 5.6 this is still always in kB
+                if scale in 'kK':
+                    val = val << 10
+                elif scale in 'mM':
+                    val = val << 20
+                elif scale in 'gG':
+                    val = val << 30
+                mp.addfield(key, val)
+        return([mp])
+
+    def _readVMStat(self, cap):
+        try:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
+            logging.warning(e.msg)
+        else:
+            mp = self.getMPClass(cap)()
+            mp.resetpoint()
+            for line in fetchOut.splitlines():
+                items = line.split()
+                if len(items) != 2:
+                    continue
+                mp.addfield(items[0], int(items[1]))
+        return([mp])
+
+    def _readCavStats(self, cap):
+        try:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
+            logging.warning(e.msg)
+        else:
+            mp = self.getMPClass(cap)()
+            mp.resetpoint()
+            rexp = re.compile(r'ipv|pppoe|vlan')
+            for line in fetchOut.splitlines():
+                if '===' in line:
+                    continue
+                if ':' in line:
+                    items = line.split(':', 2)
+                    if len(items) < 3:
+                        continue
+                    _c = re.sub(r'\s+', r'_', re.sub(r' packets', r'', items[0]))
+                    _p = items[1].split()[0]
+                    _b = items[2].strip()
+                    mp.addfield('{}_packets'.format(_c), int(_p))
+                    mp.addfield('{}_bytes'.format(_c), int(_b))
+                else:
+                    items=line.split()
+                    if len(items) == 2:
+                        if 'ipv' in items[0]:
+                            mp.addfield(items[0], int(items[1]))
+                    elif len(items) == 5:
+                        if rexp.match(items[0]):
+                            _r = items[0]
+                            mp.addfield('RX_packets_{}'.format(_r), int(items[1]))
+                            mp.addfield('RX_bytes_{}'.format(_r), int(items[2]))
+                            mp.addfield('TX_packets_{}'.format(_r), int(items[3]))
+                            mp.addfield('TX_bytes_{}'.format(_r), int(items[4]))
+        return([mp])
+
+    def _readConntrack(self, cap):
+        try:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
+            logging.warning(e.msg)
+        else:
+            mp = self.getMPClass(cap)()
+            mp.resetpoint()
+            for line in fetchOut.splitlines():
+                items = line.split(':')
+                if len(items) != 2:
+                    continue
+                mp.addfield(items[0], int(items[1]))
+        return([mp])
+
+    def _readEntropyAvail(self, cap):
+        # Note:  entropy changes continually.  This metric should be used for
+        # trending only to identify long-term persistent shortfall
+        try:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
+            logging.warning(e.msg)
+        else:
+            mp = self.getMPClass(cap)()
+            mp.resetpoint()
+            mp.addfield('entropy_avail', int(fetchOut.splitlines()[0]))
+        return([mp])
+
+    def _readInterrupts(self, cap):
+        mpList = []
+        MPClass = self.getMPClass(cap)
+        tStamp = datetime.utcnow()  # Use single timestamp for this entire measurement
+        try:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
+            logging.warning(e.msg)
+        else:
+            ic = {}
+            for line in fetchOut.splitlines():
+                if ':' in line:
+                    (irq, _r) = line.split(':',1)
+                    ic[irq.strip()] = _r.split()
+                else:
+                    cpulist = line.split()
+            ncpu = len(cpulist)
+            for i in ic.keys():
+                _c = ic[i]
+                li = len(_c) - 1
+                if li >= ncpu:
+                    # First #cpu fields are interrupt counters per cpu
+                    # Last two fields are controller and device names
+                    mp = MPClass()
+                    mp.setpoint(tStamp)
+                    mp.addtag('irq', i)
+                    mp.addtag('device', "{}/{}".format(_c[li-1],_c[li]))
+                    for x in range(ncpu):
+                        mp.addfield(cpulist[x], int(_c[x]))
+                    mpList.append(mp)
+        return(mpList)
+
+    def _readSoftIRQs(self, cap):
+        mpList = []
+        MPClass = self.getMPClass(cap)
+        tStamp = datetime.utcnow()  # Use single timestamp for this entire measurement
+        try:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
+            logging.warning(e.msg)
+        else:
+            ic = {}
+            for line in fetchOut.splitlines():
+                if ':' in line:
+                    (irq, _r) = line.split(':',1)
+                    ic[irq.strip()] = _r.split()
+                else:
+                    cpulist = line.split()
+            ncpu = len(cpulist)
+            for i in ic.keys():
+                _c = ic[i]
+                mp = MPClass()
+                mp.setpoint(tStamp)
+                mp.addtag('irq', i)
+                for x in range(ncpu):
+                    mp.addfield(cpulist[x], int(_c[x]))
+                mpList.append(mp)
+        return(mpList)
+
 #
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 
@@ -674,7 +899,9 @@ class UBNTHALSource(DataSource):
         except subprocess.CalledProcessError as e:
             logging.warning("Failed '{}' with return code {}: {}".format(
                 ' '.join(e.cmd), e.returncode, e.output))
-        # Should probably catch more exceptions, particularly OSError
+        except (IOError, OSError) as e:
+            logging.warning("Failed to excecute '{}': [Errno {}] {}".format(
+                ' '.join(e.cmd), e.errno, e.strerror))
         return(cmdOut)
 
 
@@ -745,6 +972,51 @@ class IPtableSource(DataSource):
             for t in self.tableList[p]:
                 self._extractStats(p, t)
         return(self.stats)
+
+
+class ProcFSSource(DataSource):
+    """ Class for data obtained via '/proc' """
+
+    def __init__(self, cap):
+        super(ProcFSSource, self).__init__(cap)
+        self.cap = cap
+        try:
+            self.path = PROC_PATH[cap]
+        except KeyError:
+            cls = type(self).__name__
+            func = sys._getframe(1).f_code.co_name
+            msg = '{}.{}: Unexpected attempt to use improperly-defined capability: \'{}\''.format(
+                cls, func, cap)
+            raise UnexpectedUseError(msg)
+
+    def _readProcFile(self):
+        logging.debug("About to read '{}'".format(self.path))
+        try:
+            with open(self.path, 'r') as f:
+                lines = f.read()
+        except (IOError, OSError) as e:
+            logging.warning("Failed to open/read '{}': [Errno {}] {}".format(
+                self.path, e.errno, e.strerror))
+        return(lines)
+
+    def _readProcNF(self):
+        lines = ''
+        for fn in LIST_FN_CONNTRACK:
+            fpath = os.path.join(self.path, fn)
+            logging.debug("About to read '{}'".format(fpath))
+            try:
+                with open(fpath, 'r') as f:
+                    lines='{}{}:{}'.format(lines, fn, f.readline())
+            except (IOError, OSError) as e:
+                logging.warning("Failed to open/read '{}': [Errno {}] {}".format(
+                    fpath, e.errno, e.strerror))
+        return(lines)
+
+    def getstats(self):
+        if self.cap == CAP_CONNTRACK:
+            return(self._readProcNF())
+        else:
+            return(self._readProcFile())
 
 #
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
@@ -847,6 +1119,63 @@ class IPtables(MeasurePoint):
         super(IPtables, self).__init__()
         self.measurement = CAP_IPTABLES
 
+
+class ProcMemInfo(MeasurePoint):
+    """ /proc/meminfo time series measurement """
+
+    def __init__(self):
+        super(ProcMemInfo, self).__init__()
+        self.measurement = CAP_MEMINFO
+
+
+class ProcVMStat(MeasurePoint):
+    """ /proc/vmstat time series measurement """
+
+    def __init__(self):
+        super(ProcVMStat, self).__init__()
+        self.measurement = CAP_VMSTAT
+
+
+class ProcCavStat(MeasurePoint):
+    """ /proc/cavium/stats time series measurement """
+
+    def __init__(self):
+        super(ProcCavStat, self).__init__()
+        self.measurement = CAP_CAVSTAT
+
+
+class ProcConntrack(MeasurePoint):
+    """ /proc/sys/net/netfilter time series measurement """
+
+    def __init__(self):
+        super(ProcConntrack, self).__init__()
+        self.measurement = CAP_CONNTRACK
+
+
+class ProcEntropyAvail(MeasurePoint):
+    """ /proc/sys/kernel/random/entropy_avail time series measurement """
+
+    def __init__(self):
+        super(ProcEntropyAvail, self).__init__()
+        self.measurement = CAP_ENTROPY
+
+
+class ProcInterrupts(MeasurePoint):
+    """ /proc/interrupts time series measurement """
+
+    def __init__(self):
+        super(ProcInterrupts, self).__init__()
+        self.measurement = CAP_INTERRUPTS
+
+
+class ProcSoftIRQs(MeasurePoint):
+    """ /proc/softirqs time series measurement """
+
+    def __init__(self):
+        super(ProcSoftIRQs, self).__init__()
+        self.measurement = CAP_SOFTIRQS
+
+
 #
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 
@@ -941,12 +1270,20 @@ def initLogging():
     logger = logging.getLogger()
     logger.addHandler(syslog)
 
-
 def handleException(eType, eValue, eTraceback):
     """ Replacement exception hook handler """
     """ Ensure uncaught exceptions get logged even if a daemon """
     logging.error("Fatal exception", exc_info=(eType, eValue, eTraceback))
 
+def handleSignal(sig, stack):
+    """ Generically handle some basic signals to facilitate cleanup """
+    _sigList={
+        signal.SIGQUIT: "Quit ",
+        signal.SIGTERM: "Terminate ",
+        signal.SIGABRT: "Abort "
+    }
+    logging.error("Caught {}signal [{}]".format(_sigList.get(sig,None),sig))
+    sys.exit(0)
 
 def daemonize(workdir='/', umask=0o0000):
     """ Become standard *nix daemon """
@@ -993,7 +1330,6 @@ def daemonize(workdir='/', umask=0o0000):
         raise DaemonOpenError(e)
     logging.debug('Now running as a daemon')
 
-
 def doCycle(monDev, dbC):
     """ Process one full monitor cycle """
     for c in monDev.listCap():
@@ -1008,6 +1344,9 @@ def main():
     initLogging()
     logging.info('Starting')
     sys.excepthook = handleException
+    signal.signal(signal.SIGQUIT, handleSignal)
+    signal.signal(signal.SIGTERM, handleSignal)
+    signal.signal(signal.SIGABRT, handleSignal)
     detach = DEF_DAEMON
     monDev = EdgeRouter()
     if len(monDev.listCap()) == 0:
@@ -1016,24 +1355,32 @@ def main():
         daemonize(workdir=DEF_DIR_WORK, umask=DEF_UMASK)
 
     with PidFileLock():
-        dbClient = InfluxDBPublisher(host=INFLUXDB['HOST'],
-                                     port=INFLUXDB['PORT'],
-                                     username=INFLUXDB['USER'],
-                                     password=INFLUXDB['PASSWD'],
-                                     database=INFLUXDB['DATABASE']
-                                     )
-        while True:
-            tStart = datetime.utcnow()
-            logging.debug('Begin cycle')
-            doCycle(monDev, dbClient)
-            tDiff = datetime.utcnow() - tStart
-            dSec = TIME_POLL_INTERVAL - tDiff.total_seconds()
-            if dSec > 0.0:
-                time.sleep(dSec)
-            else:
-                logging.warning(
-                    'Cycle exceeded polling interval by {} seconds'.format(abs(dSec)))
-            logging.debug('End cycle [duration {}]'.format(tDiff))
+        try:
+            dbClient = InfluxDBPublisher(host=INFLUXDB['HOST'],
+                                        port=INFLUXDB['PORT'],
+                                        username=INFLUXDB['USER'],
+                                        password=INFLUXDB['PASSWD'],
+                                        database=INFLUXDB['DATABASE']
+                                        )
+            while True:
+                tStart = datetime.utcnow()
+                logging.debug('Begin cycle')
+                doCycle(monDev, dbClient)
+                tDiff = datetime.utcnow() - tStart
+                dSec = TIME_POLL_INTERVAL - tDiff.total_seconds()
+                if dSec > 0.0:
+                    time.sleep(dSec)
+                else:
+                    logging.warning(
+                        'Cycle exceeded polling interval by {} seconds'.format(abs(dSec)))
+                logging.debug('End cycle [duration {}]'.format(tDiff))
+        except KeyboardInterrupt:
+            logging.info('Caught Interrupt [SIGINT]')
+        except SystemExit as e:
+            if e.code:
+                raise
+        finally:
+            logging.info('Exiting')
 
     # Should never reach here
     logging.info('Ending (unexpected)')
