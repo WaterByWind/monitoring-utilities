@@ -31,7 +31,8 @@ Used to supplement standard SNMP monitoring for metrics not otherwise reported.
 Initial support for Fan speeds, Temperatures, and Power consumption of
 Ubiquiti EdgeOS-based EdgeMAX platforms.  Additional support now includes
 netfilter (iptables) rule counters, detailed memory stats, conntrack,
-kernel "random" entropy, vmstat, and offload stats.
+kernel "random" entropy, vmstat, offload stats, and per-cpu interrupts
+(HW and SW).
 
 Metrics are collected and consolidated as relevant time-series measurements.
 Each poll cycle is further consolidated as a single measurement set for
@@ -43,6 +44,10 @@ with the next polling interval.  Measurement sets accumulate up to the
 maximum configured value, at which point the oldest sets are discarded
 to accomodate more recent measurements.
 
+Performance data of this monitoring daemon is also collected and published as
+part of the rest of the measurements, providing visibility into monitoring
+overhead.
+
 Logging is performed via standard python 'logger' facilities, with a
 syslog handler explicitly configured.
 """
@@ -50,7 +55,7 @@ syslog handler explicitly configured.
 __author__     = "WaterByWind"
 __copyright__  = "Copyright 2020, Waterside Consulting, inc."
 __license__    = "MIT"
-__version__    = "1.2.4"
+__version__    = "1.2.5"
 __maintainer__ = "WaterByWind"
 __email__      = "WaterByWind@WatersideConsulting.com"
 __status__     = "Development"
@@ -127,7 +132,6 @@ except ImportError:
 # - Additional publish services?
 # - Drop privileges? (not run as root)
 #   - Risk and value here?
-# - Internal metrics (cpu, etc) for tracking monitoring impact
 #
 # Modules for AgentX:
 # -- netsnmpagent:  https://pypi.python.org/pypi/netsnmpagent
@@ -195,11 +199,12 @@ CAP_CONNTRACK  = 'conntrack'
 CAP_ENTROPY    = 'randentropy'
 CAP_INTERRUPTS = 'interrupts'
 CAP_SOFTIRQS   = 'softirqs'
+CAP_SELFSTAT   = 'monstats'
 
 # Default capabilities to attempt to use
 LIST_CAP = [CAP_FANTACH, CAP_FANCTRL, CAP_POWER, CAP_TEMP, CAP_IPTABLES,
     CAP_MEMINFO, CAP_VMSTAT, CAP_CAVSTAT, CAP_CONNTRACK, CAP_ENTROPY,
-    CAP_INTERRUPTS, CAP_SOFTIRQS]
+    CAP_INTERRUPTS, CAP_SOFTIRQS, CAP_SELFSTAT]
 
 # External paths and arguments
 BIN_UBNTHAL = '/usr/sbin/ubnt-hal'
@@ -218,10 +223,12 @@ PROC_PATH = {
     CAP_CONNTRACK  : '/proc/sys/net/netfilter',
     CAP_ENTROPY    : '/proc/sys/kernel/random/entropy_avail',
     CAP_INTERRUPTS : '/proc/interrupts',
-    CAP_SOFTIRQS   : '/proc/softirqs'
+    CAP_SOFTIRQS   : '/proc/softirqs',
+    CAP_SELFSTAT   : '/proc/self/stat'
 }
 
 LIST_FN_CONNTRACK = ['nf_conntrack_max', 'nf_conntrack_count']
+LIST_PROC_MON = ['snmpd']
 
 # Device types known
 DEV_EDGEROUTER = 'edgerouter'
@@ -412,7 +419,7 @@ class InfluxDBPublisher(object):
 
     def stageQueue(self):
         if len(self._pointSet) > 0:
-            # If reached/exceeded maximum number of queueed measurement
+            # If reached/exceeded maximum number of queued measurement
             # sets discard oldest entries to accomodate new entries
             while len(self.dataList) >= MAX_SETS_QUEUED:
                 discard = self.dataList.pop(0)
@@ -576,6 +583,10 @@ class EdgeRouter(BaseDevice):
             self._regMethod(CAP_SOFTIRQS, self._readSoftIRQs)
             self._regDSClass(CAP_SOFTIRQS, ProcFSSource)
             self._regMPClass(CAP_SOFTIRQS, ProcSoftIRQs)
+        if self._checkCap(CAP_SELFSTAT):
+            self._regMethod(CAP_SELFSTAT, self._readSelfStats)
+            self._regDSClass(CAP_SELFSTAT, ProcFSSource)
+            self._regMPClass(CAP_SELFSTAT, ProcSelfStats)
 
 
     def _checkCap(self, cap):
@@ -859,6 +870,41 @@ class EdgeRouter(BaseDevice):
                     mp.addfield(cpulist[x], int(_c[x]))
                 mpList.append(mp)
         return(mpList)
+
+    def _readSelfStats(self, cap):
+        try:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
+            logging.warning(e.msg)
+        else:
+            mp = self.getMPClass(cap)()
+            mp.resetpoint()
+            items = fetchOut.split()
+            # From proc(5), fields in order:
+            #   pid comm state ppid pgrp session tty_nr tpgid flags minflt cminflt
+            #   majflt cmajflt utime stime cutime cstime priority nice num_threads
+            #   itrealvalue starttime vsize rss rsslim startcode endcode startstack
+            #   kstkesp kstkeip signal blocked sigignore sigcatch wchan nswap cnswap
+            #   exit_signal processor rt_priority policy delayacct_blkio_ticks
+            #   guest_time cguest_time start_data end_data start_brk arg_start
+            #   arg_end env_start env_end exit_code
+            mp.addtag('pid', int(items[0]))
+            mp.addtag('comm', items[1].strip('()'))
+            mp.addfield('minflt', int(items[9]))
+            mp.addfield('cminflt', int(items[10]))
+            mp.addfield('majflt', int(items[11]))
+            mp.addfield('cmajflt', int(items[12]))
+            mp.addfield('utime', int(items[13]))
+            mp.addfield('stime', int(items[14]))
+            mp.addfield('cutime', int(items[15]))
+            mp.addfield('cstime', int(items[16]))
+            mp.addfield('priority', int(items[17]))
+            mp.addfield('nice', int(items[18]))
+            mp.addfield('vsize', int(items[22]))
+            mp.addfield('rss', int(items[23]))
+            mp.addfield('rt_priority', int(items[39]))
+            mp.addfield('delayacct_blkio_ticks', int(items[41]))
+        return([mp])
 
 #
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
@@ -1174,6 +1220,14 @@ class ProcSoftIRQs(MeasurePoint):
     def __init__(self):
         super(ProcSoftIRQs, self).__init__()
         self.measurement = CAP_SOFTIRQS
+
+
+class ProcSelfStats(MeasurePoint):
+    """ /proc/self/stats time series measurement """
+
+    def __init__(self):
+        super(ProcSelfStats, self).__init__()
+        self.measurement = CAP_SELFSTAT
 
 
 #
