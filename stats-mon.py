@@ -31,8 +31,8 @@ Used to supplement standard SNMP monitoring for metrics not otherwise reported.
 Initial support for Fan speeds, Temperatures, and Power consumption of
 Ubiquiti EdgeOS-based EdgeMAX platforms.  Additional support now includes
 netfilter (iptables) rule counters, detailed memory stats, conntrack,
-kernel "random" entropy, vmstat, offload stats, and per-cpu interrupts
-(HW and SW).
+kernel "random" entropy, vmstat, offload stats, per-cpu interrupts
+(HW and SW), and kernel cache stats.
 
 Metrics are collected and consolidated as relevant time-series measurements.
 Each poll cycle is further consolidated as a single measurement set for
@@ -55,7 +55,7 @@ syslog handler explicitly configured.
 __author__     = "WaterByWind"
 __copyright__  = "Copyright 2020, Waterside Consulting, inc."
 __license__    = "MIT"
-__version__    = "1.2.5"
+__version__    = "1.2.7"
 __maintainer__ = "WaterByWind"
 __email__      = "WaterByWind@WatersideConsulting.com"
 __status__     = "Development"
@@ -85,7 +85,7 @@ from logging.handlers import SysLogHandler
 from socket import gethostname
 
 # For modules not bundled with EdgeOS, which are in turn listed below
-# This specific method is needed for now but may change back to relative imports
+# This specific (ugly) method is needed for now but may change back to relative imports
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),'lib'))
 
 # Sanitize executable search path.  'python-iptables' depends upon '/sbin'
@@ -200,11 +200,12 @@ CAP_ENTROPY    = 'randentropy'
 CAP_INTERRUPTS = 'interrupts'
 CAP_SOFTIRQS   = 'softirqs'
 CAP_SELFSTAT   = 'monstats'
+CAP_SLABINFO   = 'slabinfo'
 
 # Default capabilities to attempt to use
 LIST_CAP = [CAP_FANTACH, CAP_FANCTRL, CAP_POWER, CAP_TEMP, CAP_IPTABLES,
     CAP_MEMINFO, CAP_VMSTAT, CAP_CAVSTAT, CAP_CONNTRACK, CAP_ENTROPY,
-    CAP_INTERRUPTS, CAP_SOFTIRQS, CAP_SELFSTAT]
+    CAP_INTERRUPTS, CAP_SOFTIRQS, CAP_SELFSTAT, CAP_SLABINFO]
 
 # External paths and arguments
 BIN_UBNTHAL = '/usr/sbin/ubnt-hal'
@@ -224,7 +225,8 @@ PROC_PATH = {
     CAP_ENTROPY    : '/proc/sys/kernel/random/entropy_avail',
     CAP_INTERRUPTS : '/proc/interrupts',
     CAP_SOFTIRQS   : '/proc/softirqs',
-    CAP_SELFSTAT   : '/proc/self/stat'
+    CAP_SELFSTAT   : '/proc/self/stat',
+    CAP_SLABINFO   : '/proc/slabinfo'
 }
 
 LIST_FN_CONNTRACK = ['nf_conntrack_max', 'nf_conntrack_count']
@@ -587,7 +589,10 @@ class EdgeRouter(BaseDevice):
             self._regMethod(CAP_SELFSTAT, self._readSelfStats)
             self._regDSClass(CAP_SELFSTAT, ProcFSSource)
             self._regMPClass(CAP_SELFSTAT, ProcSelfStats)
-
+        if self._checkCap(CAP_SLABINFO):
+            self._regMethod(CAP_SLABINFO, self._readSlabinfo)
+            self._regDSClass(CAP_SLABINFO, ProcFSSource)
+            self._regMPClass(CAP_SLABINFO, ProcSlabinfo)
 
     def _checkCap(self, cap):
         supported = False
@@ -906,6 +911,48 @@ class EdgeRouter(BaseDevice):
             mp.addfield('delayacct_blkio_ticks', int(items[41]))
         return([mp])
 
+    def _readSlabinfo(self, cap):
+        mpList = []
+        MPClass = self.getMPClass(cap)
+        tStamp = datetime.utcnow()  # Use single timestamp for this entire measurement
+        try:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
+            logging.warning(e.msg)
+        else:
+            lines = fetchOut.splitlines()
+            # First line has version - we only support 2.1
+            try:
+                v = lines.pop(0).split(':')[1].strip()
+            except IndexError:
+                v = '(unknown)'
+            if v == '2.1':
+                # Second line lists fields (so we can discard)
+                # name <active_objs> <num_objs> <objsize> <objperslab> <pagesperslab> \
+                #  : tunables <limit> <batchcount> <sharedfactor> \
+                #  : slabdata <active_slabs> <num_slabs> <sharedavail>
+                line = lines.pop(0)
+                for line in lines:
+                    items = line.split()
+                    mp = MPClass()
+                    mp.setpoint(tStamp)
+                    mp.addtag('name', items[0])
+                    mp.addfield('active_objs', int(items[1]))
+                    mp.addfield('num_objs', int(items[2]))
+                    mp.addfield('objsize', int(items[3]))
+                    mp.addfield('objperslab', int(items[4]))
+                    mp.addfield('pagesperslab', int(items[5]))
+                    mp.addfield('limit', int(items[8]))
+                    mp.addfield('batchcount', int(items[9]))
+                    mp.addfield('sharedfactor', int(items[10]))
+                    mp.addfield('active_slabs', int(items[13]))
+                    mp.addfield('num_slabs', int(items[14]))
+                    mp.addfield('sharedavail', int(items[15]))
+                    mpList.append(mp)
+            else:
+                logging.warning('Unrecognized /proc/slabinfo, version {}'.format(v))
+        return(mpList)
+
 #
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 
@@ -939,6 +986,7 @@ class UBNTHALSource(DataSource):
             raise UnexpectedUseError(msg)
 
     def getstats(self):
+        cmdOut = ''
         logging.debug("About to exec '{}'".format(' '.join(self.cmd)))
         try:
             cmdOut = subprocess.check_output(self.cmd, stderr=subprocess.STDOUT)
@@ -1229,6 +1277,13 @@ class ProcSelfStats(MeasurePoint):
         super(ProcSelfStats, self).__init__()
         self.measurement = CAP_SELFSTAT
 
+
+class ProcSlabinfo(MeasurePoint):
+    """ /proc/slabinfo time series measurement """
+
+    def __init__(self):
+        super(ProcSlabinfo, self).__init__()
+        self.measurement = CAP_SLABINFO
 
 #
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
