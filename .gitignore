@@ -1,19 +1,44 @@
-######################
-# OS generated files #
-######################
+#########################
+# macOS files           #
+#########################
+
 .DS_Store
-.DS_Store?
-.Spotlight-V100
-.Trashes
+.AppleDouble
+.LSOverride
 ._*
-.swp
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Icon must end with two \r
+Icon
+
+#########################
+# windows files         #
+#########################
+
 Thumbs.db
 ehthumbs.db
+
+#########################
+# editor files          #
+#########################
+
+.swp
 
 ##########################
 # Python                 #
 ##########################
-# 
+ 
 __pycache__/
 __pypackages__/
 *.py[cod]
