@@ -1,0 +1,29 @@
+######################
+# OS generated files #
+######################
+.DS_Store
+.DS_Store?
+.Spotlight-V100
+.Trashes
+._*
+.swp
+Thumbs.db
+ehthumbs.db
+
+##########################
+# Python                 #
+##########################
+# 
+__pycache__/
+__pypackages__/
+*.py[cod]
+*$py.class
+*.so
+*.manifest
+*.spec
+.cache
+.pytest_cache/
+.pyre/
+.pytype/
+cython_debug/
+
