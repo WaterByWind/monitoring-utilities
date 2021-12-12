@@ -3,7 +3,7 @@
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 # The MIT License (MIT)
 #
-# Copyright (c) 2016-2020 Waterside Consulting, inc.
+# Copyright (c) 2016-2021 Waterside Consulting, inc.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -32,7 +32,7 @@ Initial support for Fan speeds, Temperatures, and Power consumption of
 Ubiquiti EdgeOS-based EdgeMAX platforms.  Additional support now includes
 netfilter (iptables) rule counters, detailed memory stats, conntrack,
 kernel "random" entropy, vmstat, offload stats, per-cpu interrupts
-(HW and SW), and kernel cache stats.
+(HW and SW), kernel cache stats, and process stats.
 
 Metrics are collected and consolidated as relevant time-series measurements.
 Each poll cycle is further consolidated as a single measurement set for
@@ -53,9 +53,9 @@ syslog handler explicitly configured.
 """
 
 __author__     = "WaterByWind"
-__copyright__  = "Copyright 2020, Waterside Consulting, inc."
+__copyright__  = "Copyright 2021, Waterside Consulting, inc."
 __license__    = "MIT"
-__version__    = "1.2.7"
+__version__    = "1.2.8"
 __maintainer__ = "WaterByWind"
 __email__      = "WaterByWind@WatersideConsulting.com"
 __status__     = "Development"
@@ -86,7 +86,7 @@ from socket import gethostname
 
 # For modules not bundled with EdgeOS, which are in turn listed below
 # This specific (ugly) method is needed for now but may change back to relative imports
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),'lib'))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib'))
 
 # Sanitize executable search path.  'python-iptables' depends upon '/sbin'
 # being in the PATH, so let's just get this out of the way now.
@@ -99,7 +99,7 @@ from influxdb import InfluxDBClient
 from influxdb.exceptions import InfluxDBClientError
 from influxdb.exceptions import InfluxDBServerError
 
-# Try to use improved subprocess32 from Python 3
+# Try to use improved subprocess32 backport from Python 3
 # If not available fall back to original module
 if os.name == 'posix' and sys.version_info[0] < 3:
     try:
@@ -122,7 +122,6 @@ except ImportError:
 ##
 # TODOs
 ##
-## Need check for running as root
 #
 # - cmd line options
 # - possible as snmpd subagent (AgentX?)
@@ -148,10 +147,14 @@ except ImportError:
 TIME_POLL_INTERVAL = 60.0
 
 # Maximum number of queued measurement sets
+# Beware of memory constraints here
 MAX_SETS_QUEUED = 1440
 
 # Detach and become daemon?
 DEF_DAEMON = True
+
+# Unprivileged user to run as, if existing
+DEF_USER = 'statsmon'
 
 # Logging
 LOGLEVEL = logging.INFO                 # Python logging level
@@ -201,11 +204,12 @@ CAP_INTERRUPTS = 'interrupts'
 CAP_SOFTIRQS   = 'softirqs'
 CAP_SELFSTAT   = 'monstats'
 CAP_SLABINFO   = 'slabinfo'
+CAP_PIDSTAT    = 'pidstats'
 
-# Default capabilities to attempt to use
+# Default capabilities to attempt to use, from known list above
 LIST_CAP = [CAP_FANTACH, CAP_FANCTRL, CAP_POWER, CAP_TEMP, CAP_IPTABLES,
-    CAP_MEMINFO, CAP_VMSTAT, CAP_CAVSTAT, CAP_CONNTRACK, CAP_ENTROPY,
-    CAP_INTERRUPTS, CAP_SOFTIRQS, CAP_SELFSTAT, CAP_SLABINFO]
+            CAP_MEMINFO, CAP_VMSTAT, CAP_CAVSTAT, CAP_CONNTRACK, CAP_ENTROPY,
+            CAP_INTERRUPTS, CAP_SOFTIRQS, CAP_SELFSTAT, CAP_PIDSTAT, CAP_SLABINFO]
 
 # External paths and arguments
 BIN_UBNTHAL = '/usr/sbin/ubnt-hal'
@@ -226,11 +230,14 @@ PROC_PATH = {
     CAP_INTERRUPTS : '/proc/interrupts',
     CAP_SOFTIRQS   : '/proc/softirqs',
     CAP_SELFSTAT   : '/proc/self/stat',
-    CAP_SLABINFO   : '/proc/slabinfo'
+    CAP_SLABINFO   : '/proc/slabinfo',
+    CAP_PIDSTAT    : '/proc/1/stat'            # Do not change PID here
 }
 
 LIST_FN_CONNTRACK = ['nf_conntrack_max', 'nf_conntrack_count']
-LIST_PROC_MON = ['snmpd']
+# 'exe' is actually 'udap-bridge' child :(
+LIST_PROC_MON = ['ubnt-cfgd', 'ubnt-daemon', 'ubnt-util', 'ubnt-udapi-serv',
+                 'snmpd', 'charon', 'udapi-bridge', 'exe']
 
 # Device types known
 DEV_EDGEROUTER = 'edgerouter'
@@ -280,6 +287,14 @@ class NothingToDo(RuntimeError):
     def __init__(self, msg='(unknown)'):
         self.msg = 'Nothing to do: {}'.format(msg)
         super(NothingToDo, self).__init__(self.msg)
+
+
+class InsufficientPrivilegeError(RuntimeError):
+    """ Exception for lack of privileges """
+
+    def __init__(self, msg='(unknown)'):
+        self.msg = 'Insufficient privileges: {}'.format(msg)
+        super(InsufficientPrivilegeError, self).__init__(self.msg)
 
 
 class InternalError(RuntimeError):
@@ -358,9 +373,10 @@ class DaemonOpenError(DaemonError):
 # Publisher Classes
 ##
 # -- perhaps create base class TimeSeriesPublisher with more dbs supported?
+#
 
 class InfluxDBPublisher(object):
-    """ Class for publishing to InfluxDB time-series database """
+    """ Class for publishing to InfluxDB v1 time-series database """
 
     def __init__(self,
                  host='localhost',
@@ -409,7 +425,7 @@ class InfluxDBPublisher(object):
             logging.error('InfluxDBClientError: {}'.format(e))
         except InfluxDBServerError as e:
             logging.error('InfluxDBServerError: {}'.format(e))
-        except:
+        except Exception:
             e = sys.exc_info()[0]
             logging.error('Exception: {}'.format(e))
         else:
@@ -593,6 +609,10 @@ class EdgeRouter(BaseDevice):
             self._regMethod(CAP_SLABINFO, self._readSlabinfo)
             self._regDSClass(CAP_SLABINFO, ProcFSSource)
             self._regMPClass(CAP_SLABINFO, ProcSlabinfo)
+        if self._checkCap(CAP_PIDSTAT):
+            self._regMethod(CAP_PIDSTAT, self._readPIDStats)
+            self._regDSClass(CAP_PIDSTAT, ProcFSSourceMulti)
+            self._regMPClass(CAP_PIDSTAT, ProcPIDStats)
 
     def _checkCap(self, cap):
         supported = False
@@ -602,7 +622,8 @@ class EdgeRouter(BaseDevice):
             supported = os.path.isfile(PROC_PATH[cap])
         elif cap in CMD_HAL:
             try:
-                out = subprocess.check_output([BIN_UBNTHAL, CMD_HAL[cap]],
+                out = subprocess.check_output(
+                    [BIN_UBNTHAL, CMD_HAL[cap]],
                     stderr=subprocess.STDOUT).splitlines()[-1]
             except subprocess.CalledProcessError:
                 pass
@@ -692,7 +713,7 @@ class EdgeRouter(BaseDevice):
         try:
             fetchOut = self._fetchData(cap)
         except (UnexpectedUseError, UnexpectedTableError,
-            MissingDataSourceError, MeasureMismatchError) as e:
+                MissingDataSourceError, MeasureMismatchError) as e:
             logging.warning(e.msg)
         else:
             for p in fetchOut.keys():
@@ -776,7 +797,7 @@ class EdgeRouter(BaseDevice):
                     mp.addfield('{}_packets'.format(_c), int(_p))
                     mp.addfield('{}_bytes'.format(_c), int(_b))
                 else:
-                    items=line.split()
+                    items = line.split()
                     if len(items) == 2:
                         if 'ipv' in items[0]:
                             mp.addfield(items[0], int(items[1]))
@@ -829,7 +850,7 @@ class EdgeRouter(BaseDevice):
             ic = {}
             for line in fetchOut.splitlines():
                 if ':' in line:
-                    (irq, _r) = line.split(':',1)
+                    (irq, _r) = line.split(':', 1)
                     ic[irq.strip()] = _r.split()
                 else:
                     cpulist = line.split()
@@ -843,7 +864,7 @@ class EdgeRouter(BaseDevice):
                     mp = MPClass()
                     mp.setpoint(tStamp)
                     mp.addtag('irq', i)
-                    mp.addtag('device', "{}/{}".format(_c[li-1],_c[li]))
+                    mp.addtag('device', "{}/{}".format(_c[li-1], _c[li]))
                     for x in range(ncpu):
                         mp.addfield(cpulist[x], int(_c[x]))
                     mpList.append(mp)
@@ -861,7 +882,7 @@ class EdgeRouter(BaseDevice):
             ic = {}
             for line in fetchOut.splitlines():
                 if ':' in line:
-                    (irq, _r) = line.split(':',1)
+                    (irq, _r) = line.split(':', 1)
                     ic[irq.strip()] = _r.split()
                 else:
                     cpulist = line.split()
@@ -873,6 +894,46 @@ class EdgeRouter(BaseDevice):
                 mp.addtag('irq', i)
                 for x in range(ncpu):
                     mp.addfield(cpulist[x], int(_c[x]))
+                mpList.append(mp)
+        return(mpList)
+
+    def _readPIDStats(self, cap):
+        mpList = []
+        MPClass = self.getMPClass(cap)
+        tStamp = datetime.utcnow()  # Use single timestamp for this entire measurement
+        try:
+            fetchOut = self._fetchData(cap)
+        except (UnexpectedUseError, MissingDataSourceError, MeasureMismatchError) as e:
+            logging.warning(e.msg)
+        else:
+            for line in fetchOut:
+                mp = MPClass()
+                mp.setpoint(tStamp)
+                items = line.split()
+                # From proc(5), fields in order:
+                #   pid comm state ppid pgrp session tty_nr tpgid flags minflt cminflt
+                #   majflt cmajflt utime stime cutime cstime priority nice num_threads
+                #   itrealvalue starttime vsize rss rsslim startcode endcode startstack
+                #   kstkesp kstkeip signal blocked sigignore sigcatch wchan nswap cnswap
+                #   exit_signal processor rt_priority policy delayacct_blkio_ticks
+                #   guest_time cguest_time start_data end_data start_brk arg_start
+                #   arg_end env_start env_end exit_code
+                mp.addtag('pid', int(items[0]))
+                mp.addtag('comm', items[1].strip('()'))
+                mp.addfield('minflt', int(items[9]))
+                mp.addfield('cminflt', int(items[10]))
+                mp.addfield('majflt', int(items[11]))
+                mp.addfield('cmajflt', int(items[12]))
+                mp.addfield('utime', int(items[13]))
+                mp.addfield('stime', int(items[14]))
+                mp.addfield('cutime', int(items[15]))
+                mp.addfield('cstime', int(items[16]))
+                mp.addfield('priority', int(items[17]))
+                mp.addfield('nice', int(items[18]))
+                mp.addfield('vsize', int(items[22]))
+                mp.addfield('rss', int(items[23]))
+                mp.addfield('rt_priority', int(items[39]))
+                mp.addfield('delayacct_blkio_ticks', int(items[41]))
                 mpList.append(mp)
         return(mpList)
 
@@ -1100,7 +1161,7 @@ class ProcFSSource(DataSource):
             logging.debug("About to read '{}'".format(fpath))
             try:
                 with open(fpath, 'r') as f:
-                    lines='{}{}:{}'.format(lines, fn, f.readline())
+                    lines = '{}{}:{}'.format(lines, fn, f.readline())
             except (IOError, OSError) as e:
                 logging.warning("Failed to open/read '{}': [Errno {}] {}".format(
                     fpath, e.errno, e.strerror))
@@ -1111,6 +1172,58 @@ class ProcFSSource(DataSource):
             return(self._readProcNF())
         else:
             return(self._readProcFile())
+
+
+class ProcFSSourceMulti(DataSource):
+    """ Class for data obtained via '/proc', multiple instance """
+
+    def __init__(self, cap):
+        super(ProcFSSourceMulti, self).__init__(cap)
+        self.cap = cap
+        try:
+            self.path = PROC_PATH[cap]
+        except KeyError:
+            cls = type(self).__name__
+            func = sys._getframe(1).f_code.co_name
+            msg = '{}.{}: Unexpected attempt to use improperly-defined capability: \'{}\''.format(
+                cls, func, cap)
+            raise UnexpectedUseError(msg)
+
+    def _readProcFile(self):
+        # For defined list of process names, collect single-line file data
+        # and return as simple list, one per PID
+        lines = []
+        pidlist = []
+        ptrn = re.compile(r'\d')
+        logging.debug("Searching for PIDs matching names '{}'".format(','.join(LIST_PROC_MON)))
+        for pid in os.listdir('/proc'):
+            if re.match(ptrn, pid):
+                try:
+                    with open('/proc/{}/comm'.format(pid), 'r') as f:
+                        if f.readline().split('/')[0].strip() in LIST_PROC_MON:
+                            logging.debug("Found matching PID {} for proc stats".format(pid))
+                            pidlist.append(pid)
+                except Exception:
+                    continue
+        for pid in pidlist:
+            fpath = self.path.replace('/1/', '/{}/'.format(pid))
+            logging.debug("About to read '{}'".format(fpath))
+            try:
+                with open(fpath, 'r') as f:
+                    lines.append(f.readline())
+            except (IOError, OSError) as e:
+                # It is possible the process ended shortly after
+                # the pid list was collected, so silently ignore this here
+                if e.errno == 2:  # No such file or directory
+                    continue
+                logging.warning("Failed to open/read '{}': [Errno {}] {}".format(
+                    fpath, e.errno, e.strerror))
+        return(lines)
+
+    def getstats(self):
+        # CAP_PIDSTAT
+        return(self._readProcFile())
+
 
 #
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
@@ -1157,9 +1270,9 @@ class MeasurePoint(object):
 
     def getRecInflux(self):
         t = ','.join(['{}={}'.format(k, self.tags[k])
-                      for k in self.tags.keys()])
+                     for k in self.tags.keys()])
         f = ','.join(['{}={}'.format(k, self.fields[k])
-                      for k in self.fields.keys()])
+                     for k in self.fields.keys()])
         s = '{},{} {} {}Z'.format(
             self.measurement, t, f, self.tstamp.isoformat('T'))
         return(s)
@@ -1270,7 +1383,15 @@ class ProcSoftIRQs(MeasurePoint):
         self.measurement = CAP_SOFTIRQS
 
 
-class ProcSelfStats(MeasurePoint):
+class ProcPIDStats(MeasurePoint):
+    """ /proc/__PID__/stats time series measurement """
+
+    def __init__(self):
+        super(ProcPIDStats, self).__init__()
+        self.measurement = CAP_PIDSTAT
+
+
+class ProcSelfStats(ProcPIDStats):
     """ /proc/self/stats time series measurement """
 
     def __init__(self):
@@ -1285,6 +1406,8 @@ class ProcSlabinfo(MeasurePoint):
         super(ProcSlabinfo, self).__init__()
         self.measurement = CAP_SLABINFO
 
+
+
 #
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 
@@ -1298,7 +1421,7 @@ class PidFileLock(object):
 
     def __init__(self):
         self.pid = os.getpid()
-        self.fpath = '/'.join((LOCKDIR, LOCKFILE))
+        self.fpath = os.path.join(LOCKDIR, LOCKFILE)
         self.fd = None
 
     def __enter__(self):
@@ -1386,12 +1509,12 @@ def handleException(eType, eValue, eTraceback):
 
 def handleSignal(sig, stack):
     """ Generically handle some basic signals to facilitate cleanup """
-    _sigList={
+    _sigList = {
         signal.SIGQUIT: "Quit ",
         signal.SIGTERM: "Terminate ",
         signal.SIGABRT: "Abort "
     }
-    logging.error("Caught {}signal [{}]".format(_sigList.get(sig,None),sig))
+    logging.error("Caught {}signal [{}]".format(_sigList.get(sig, None), sig))
     sys.exit(0)
 
 def daemonize(workdir='/', umask=0o0000):
@@ -1457,6 +1580,8 @@ def main():
     signal.signal(signal.SIGTERM, handleSignal)
     signal.signal(signal.SIGABRT, handleSignal)
     detach = DEF_DAEMON
+    if os.geteuid() != 0:
+        raise InsufficientPrivilegeError("Must start as 'root' user")
     monDev = EdgeRouter()
     if len(monDev.listCap()) == 0:
         raise NothingToDo('No monitorable entities found')
@@ -1466,11 +1591,11 @@ def main():
     with PidFileLock():
         try:
             dbClient = InfluxDBPublisher(host=INFLUXDB['HOST'],
-                                        port=INFLUXDB['PORT'],
-                                        username=INFLUXDB['USER'],
-                                        password=INFLUXDB['PASSWD'],
-                                        database=INFLUXDB['DATABASE']
-                                        )
+                                         port=INFLUXDB['PORT'],
+                                         username=INFLUXDB['USER'],
+                                         password=INFLUXDB['PASSWD'],
+                                         database=INFLUXDB['DATABASE']
+                                         )
             while True:
                 tStart = datetime.utcnow()
                 logging.debug('Begin cycle')
